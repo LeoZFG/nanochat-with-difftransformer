@@ -25,6 +25,10 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
 
+def diff_func(attn1: torch.Tensor, attn2: torch.Tensor, lambda_val: torch.Tensor) -> torch.Tensor:
+    return attn1 - torch.sigmoid(lambda_val).unsqueeze(-1) * attn2
+
+
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
@@ -64,21 +68,33 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+
+        #two times regular q heads
+        self.n_q_head = 2 * self.n_head
+
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+
+        #projection matrices -> q matrix has 2x num heads
+        self.c_q = nn.Linear(self.n_embd, self.n_q_head * self.head_dim, bias=False)
+
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
+        #lambda value in diff attention mechanism
+        self.lambda_proj = nn.Linear(self.n_embd, self.n_head, bias=False)
+
+
+
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        q = self.c_q(x).view(B, T, self.n_q_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
@@ -97,11 +113,13 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            attn = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
+
+            attn = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
                 k=k, v=v,
                 cache_seqlens=kv_cache.cache_seqlens,
@@ -111,7 +129,11 @@ class CausalSelfAttention(nn.Module):
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
-
+    
+        lambda_val = self.lambda_proj(x)
+        attn1, attn2 = attn[:, :, 0::2], attn[:, :, 1::2]
+        y = diff_func(attn1, attn2, lambda_val)
+        
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
